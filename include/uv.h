@@ -241,6 +241,12 @@ typedef enum {
   UV_RUN_NOWAIT
 } uv_run_mode;
 
+typedef enum {
+  UV_LOOP_UNLOCK = 0,
+  UV_LOOP_LOCK
+  /* Note: can be extended with the notion of readers and try_lock operation */
+} uv_looplock_mode;
+
 
 UV_EXTERN unsigned int uv_version(void);
 UV_EXTERN const char* uv_version_string(void);
@@ -317,6 +323,7 @@ typedef void (*uv_getnameinfo_cb)(uv_getnameinfo_t* req,
                                   int status,
                                   const char* hostname,
                                   const char* service);
+typedef void (*uv_looplock_cb)(uv_loop_t* loop, uv_looplock_mode mode);
 
 typedef struct {
   long tv_sec;
@@ -1616,6 +1623,9 @@ struct uv_loop_s {
   /* Internal flag to signal loop stop. */
   unsigned int stop_flag;
   void* reserved[4];
+  /* Locking support */
+  uv_looplock_cb looplock_cb;
+  /* The rest */
   UV_LOOP_PRIVATE_FIELDS
 };
 

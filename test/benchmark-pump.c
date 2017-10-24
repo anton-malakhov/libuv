@@ -21,6 +21,7 @@
 
 #include "task.h"
 #include "uv.h"
+#include "threads.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -84,6 +85,16 @@ static double gbit(int64_t bytes, int64_t passed_ms) {
   return gbits / ((double)passed_ms / 1000);
 }
 
+#if 0
+static void write_sockets_close_cb(uv_handle_t* handle) {
+  /*free(handle);*/
+  if(--write_sockets == 0) {
+    /*uv_stop(handle->loop);*/
+    fprintf(stderr, "Reached last write socket close\n");
+    fflush(stderr);
+ }
+}
+#endif
 
 static void show_stats(uv_timer_t* handle) {
   int64_t diff;
@@ -114,8 +125,8 @@ static void show_stats(uv_timer_t* handle) {
       else
         uv_close((uv_handle_t*) &pipe_write_handles[i], NULL);
     }
-
-    exit(0);
+    i = uv_timer_stop(&timer_handle);
+    ASSERT(i == 0);
   }
 
   /* Reset read and write counters */
@@ -186,16 +197,24 @@ static void read_cb(uv_stream_t* stream, ssize_t bytes, const uv_buf_t* buf) {
   nrecv_total += bytes;
 }
 
-
 static void write_cb(uv_write_t* req, int status) {
-  ASSERT(status == 0);
-
+  uv_handle_t* handle = (uv_handle_t*) req->handle;
   req_free((uv_req_t*) req);
+
+  if(status != 0) {
+    if(status != UV_ECANCELED) {
+      fprintf(stderr, "uv_write error: %s\n", uv_strerror(status));
+      ASSERT(status == UV_EPIPE);
+      uv_close(handle, NULL);
+    }
+    return;
+  }
 
   nsent += sizeof write_buffer;
   nsent_total += sizeof write_buffer;
 
-  do_write((uv_stream_t*) req->handle);
+  if(!uv_is_closing(handle)) /* TODO: fix the logic in libuv */
+    do_write((uv_stream_t*) handle);
 }
 
 
@@ -209,6 +228,8 @@ static void do_write(uv_stream_t* stream) {
 
   req = (uv_write_t*) req_alloc();
   r = uv_write(req, stream, &buf, 1, write_cb);
+  if(r)
+    fprintf(stderr, "uv_write error: %s\n", uv_strerror(r));
   ASSERT(r == 0);
 }
 
@@ -373,7 +394,7 @@ static void buf_free(const uv_buf_t* buf) {
 }
 
 
-HELPER_IMPL(tcp_pump_server) {
+static void tcp_server() {
   int r;
 
   type = TCP;
@@ -389,14 +410,25 @@ HELPER_IMPL(tcp_pump_server) {
   ASSERT(r == 0);
   r = uv_listen((uv_stream_t*)&tcpServer, MAX_WRITE_HANDLES, connection_cb);
   ASSERT(r == 0);
+}
 
+HELPER_IMPL(tcp_pump_server) {
+  tcp_server();
   uv_run(loop, UV_RUN_DEFAULT);
 
+  MAKE_VALGRIND_HAPPY();
   return 0;
 }
 
+HELPER_IMPL(tcp_pump_threads_server) {
+  tcp_server();
+  locked_pool_threads_run();
 
-HELPER_IMPL(pipe_pump_server) {
+  MAKE_VALGRIND_HAPPY();
+  return 0;
+}
+
+static void pipe_server() {
   int r;
   type = PIPE;
 
@@ -410,8 +442,19 @@ HELPER_IMPL(pipe_pump_server) {
   ASSERT(r == 0);
   r = uv_listen((uv_stream_t*)&pipeServer, MAX_WRITE_HANDLES, connection_cb);
   ASSERT(r == 0);
+}
 
+HELPER_IMPL(pipe_pump_server) {
+  pipe_server();
   uv_run(loop, UV_RUN_DEFAULT);
+
+  MAKE_VALGRIND_HAPPY();
+  return 0;
+}
+
+HELPER_IMPL(pipe_pump_threads_server) {
+  pipe_server();
+  locked_pool_threads_run();
 
   MAKE_VALGRIND_HAPPY();
   return 0;
@@ -429,10 +472,42 @@ static void tcp_pump(int n) {
 
   /* Start making connections */
   maybe_connect_some();
+}
 
+
+BENCHMARK_IMPL(tcp_pump100_client) {
+  tcp_pump(10);
   uv_run(loop, UV_RUN_DEFAULT);
 
   MAKE_VALGRIND_HAPPY();
+  return 0;
+}
+
+
+BENCHMARK_IMPL(tcp_pump1_client) {
+  tcp_pump(1);
+  uv_run(loop, UV_RUN_DEFAULT);
+
+  MAKE_VALGRIND_HAPPY();
+  return 0;
+}
+
+
+BENCHMARK_IMPL(tcp_pump100_threads_client) {
+  tcp_pump(10);
+  locked_pool_threads_run();
+
+  MAKE_VALGRIND_HAPPY();
+  return 0;
+}
+
+
+BENCHMARK_IMPL(tcp_pump1_threads_client) {
+  tcp_pump(1);
+  locked_pool_threads_run();
+
+  MAKE_VALGRIND_HAPPY();
+  return 0;
 }
 
 
@@ -445,32 +520,39 @@ static void pipe_pump(int n) {
 
   /* Start making connections */
   maybe_connect_some();
-
-  uv_run(loop, UV_RUN_DEFAULT);
-
-  MAKE_VALGRIND_HAPPY();
-}
-
-
-BENCHMARK_IMPL(tcp_pump100_client) {
-  tcp_pump(100);
-  return 0;
-}
-
-
-BENCHMARK_IMPL(tcp_pump1_client) {
-  tcp_pump(1);
-  return 0;
 }
 
 
 BENCHMARK_IMPL(pipe_pump100_client) {
   pipe_pump(100);
+  uv_run(loop, UV_RUN_DEFAULT);
+
+  MAKE_VALGRIND_HAPPY();
   return 0;
 }
 
 
 BENCHMARK_IMPL(pipe_pump1_client) {
   pipe_pump(1);
+  uv_run(loop, UV_RUN_DEFAULT);
+
+  MAKE_VALGRIND_HAPPY();
+  return 0;
+}
+
+BENCHMARK_IMPL(pipe_pump100_threads_client) {
+  pipe_pump(100);
+  locked_pool_threads_run();
+
+  MAKE_VALGRIND_HAPPY();
+  return 0;
+}
+
+
+BENCHMARK_IMPL(pipe_pump1_threads_client) {
+  pipe_pump(1);
+  locked_pool_threads_run();
+
+  MAKE_VALGRIND_HAPPY();
   return 0;
 }

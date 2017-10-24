@@ -750,6 +750,7 @@ static int uv__handle_fd(uv_handle_t* handle) {
 }
 
 static void uv__write(uv_stream_t* stream) {
+  uv_loop_t* loop = stream->loop;
   struct iovec* iov;
   QUEUE* q;
   uv_write_t* req;
@@ -757,13 +758,24 @@ static void uv__write(uv_stream_t* stream) {
   int iovcnt;
   ssize_t n;
   int err;
+  int fd = uv__stream_fd(stream);
 
 start:
 
-  assert(uv__stream_fd(stream) >= 0);
+  assert(fd >= 0);
 
   if (QUEUE_EMPTY(&stream->write_queue))
     return;
+  if (stream->flags & UV_CONC_WRITTING) {
+    if (!(stream->flags & UV_STREAM_BLOCKING))
+      return;
+    do {
+      UV_LOOPLOCK(loop, UV_LOOP_UNLOCK);
+      usleep(0); /* let the other thread run TODO: how often it happens? run uvl_loop instead? */
+      UV_LOOPLOCK(loop, UV_LOOP_LOCK);
+    } while(stream->flags & UV_CONC_WRITTING);
+
+  }
 
   q = QUEUE_HEAD(&stream->write_queue);
   req = QUEUE_DATA(q, uv_write_t, queue);
@@ -844,11 +856,13 @@ start:
     while (n == -1 && errno == EINTR);
 #endif
   } else {
+    stream->flags |= UV_CONC_WRITTING;
+    UV_LOOPLOCK(loop, UV_LOOP_UNLOCK);
     do {
       if (iovcnt == 1) {
-        n = write(uv__stream_fd(stream), iov[0].iov_base, iov[0].iov_len);
+        n = write(fd, iov[0].iov_base, iov[0].iov_len);
       } else {
-        n = writev(uv__stream_fd(stream), iov, iovcnt);
+        n = writev(fd, iov, iovcnt);
       }
     }
 #if defined(__APPLE__)
@@ -862,6 +876,9 @@ start:
 #else
     while (n == -1 && errno == EINTR);
 #endif
+    UV_LOOPLOCK(loop, UV_LOOP_LOCK);
+    assert(stream->flags & UV_CONC_WRITTING);
+    stream->flags &= ~UV_CONC_WRITTING;
   }
 
   if (n < 0) {
@@ -1134,6 +1151,9 @@ static void uv__read(uv_stream_t* stream) {
 
   stream->flags &= ~UV_STREAM_READ_PARTIAL;
 
+  /* uv__io_t->running should prevent reentering to this function */
+  assert(!(stream->flags & UV_CONC_READING));
+
   /* Prevent loop starvation when the data comes in as fast as (or faster than)
    * we can read it. XXX Need to rearm fd if we switch to edge-triggered I/O.
    */
@@ -1161,10 +1181,15 @@ static void uv__read(uv_stream_t* stream) {
     assert(uv__stream_fd(stream) >= 0);
 
     if (!is_ipc) {
+      stream->flags |= UV_CONC_READING;
+      UV_LOOPLOCK(stream->loop, UV_LOOP_UNLOCK);
       do {
         nread = read(uv__stream_fd(stream), buf.base, buf.len);
       }
       while (nread < 0 && errno == EINTR);
+      UV_LOOPLOCK(stream->loop, UV_LOOP_LOCK);
+      assert(stream->flags & UV_CONC_READING);
+      stream->flags &= ~UV_CONC_READING;
     } else {
       /* ipc uses recvmsg */
       msg.msg_flags = 0;
@@ -1272,8 +1297,8 @@ int uv_shutdown(uv_shutdown_t* req, uv_stream_t* stream, uv_shutdown_cb cb) {
          stream->type == UV_NAMED_PIPE);
 
   if (!(stream->flags & UV_STREAM_WRITABLE) ||
-      stream->flags & UV_STREAM_SHUT ||
-      stream->flags & UV_STREAM_SHUTTING ||
+      (stream->flags & UV_STREAM_SHUT) ||
+      (stream->flags & UV_STREAM_SHUTTING) ||
       uv__is_closing(stream)) {
     return UV_ENOTCONN;
   }
@@ -1337,7 +1362,9 @@ static void uv__stream_io(uv_loop_t* loop, uv__io_t* w, unsigned int events) {
 
   if (events & (POLLOUT | POLLERR | POLLHUP)) {
     uv__write(stream);
-    uv__write_callbacks(stream);
+    /* stream can be closed concurently during unlocked write */
+    if (uv__stream_fd(stream) != -1)
+      uv__write_callbacks(stream);
 
     /* Write queue drained. */
     if (QUEUE_EMPTY(&stream->write_queue))
