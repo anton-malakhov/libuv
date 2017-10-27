@@ -33,7 +33,7 @@ static int TARGET_CONNECTIONS;
 
 #define PRINT_STATS                 0
 #define STATS_INTERVAL              1000 /* msec */
-#define STATS_COUNT                 5
+#define STATS_COUNT                 10
 
 
 static void do_write(uv_stream_t*);
@@ -125,7 +125,7 @@ static void show_stats(uv_timer_t* handle) {
       else
         uv_close((uv_handle_t*) &pipe_write_handles[i], NULL);
     }
-    i = uv_timer_stop(&timer_handle);
+    i = uv_timer_stop(handle);
     ASSERT(i == 0);
   }
 
@@ -210,11 +210,11 @@ static void write_cb(uv_write_t* req, int status) {
     return;
   }
 
-  nsent += sizeof write_buffer;
-  nsent_total += sizeof write_buffer;
-
-  if(!uv_is_closing(handle)) /* TODO: fix the logic in libuv */
+  if(!uv_is_closing(handle)) {/* TODO: fix the logic in libuv */
+    nsent += sizeof write_buffer;
+    nsent_total += sizeof write_buffer;
     do_write((uv_stream_t*) handle);
+  }
 }
 
 
